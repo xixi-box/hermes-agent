@@ -7,6 +7,7 @@ import {
   $botsPaneVisible,
   $focusedBotOwner,
   $openBotChat,
+  $pendingProfileEdit,
   $rosterHydrated,
   $selectedRosterHydrated,
   $selectedRosterKey,
@@ -244,6 +245,15 @@ export function BotsPane() {
   const [createOpen, setCreateOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState<null | RosterRow>(null)
+  const pendingProfileEdit = useValue($pendingProfileEdit)
+
+  useEffect(() => {
+    if (pendingProfileEdit) {
+      setEditing(pendingProfileEdit)
+      $pendingProfileEdit.set(null)
+    }
+  }, [pendingProfileEdit])
+
   // `path` is the profile directory the gateway reports on a profiles.list row;
   // it is not part of the shared RosterRow model, so it rides as an extra here.
   const [deleting, setDeleting] = useState<null | (RosterRow & { path?: string })>(null)

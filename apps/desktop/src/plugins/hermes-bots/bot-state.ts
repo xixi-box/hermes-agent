@@ -11,7 +11,7 @@
 import { atom, host } from '@hermes/plugin-sdk'
 
 import { botRosterKey, botSelectionKey } from './data'
-import { getPluginCtx } from './shared'
+import { getPluginCtx, ID } from './shared'
 import type { RosterRow } from './types'
 
 // last_active watermark per source-qualified bot, seeded on first poll so a
@@ -46,6 +46,14 @@ export const $selectedRosterHydrated = atom(false)
 export const $rosterHydrated = atom(false)
 /** Mirrors host.paneVisibility('hermes-bots:pane') — wired in register(). */
 export const $botsPaneVisible = atom(false)
+/** Persistent notice actions can outlive the pane that created them. */
+export const $pendingProfileEdit = atom<null | RosterRow>(null)
+
+export function requestBotProfileEdit(bot: RosterRow): void {
+  $pendingProfileEdit.set(bot)
+  host.revealPane(`${ID}:pane`)
+}
+
 /** An explicit open landed: {key, openedRegistryId, openedSessionId}. The
  *  registry id is empty for the legacy newChat draft fallback and for a click
  *  that came back to the bot's already-open tabs (only openedSessionId set — no
