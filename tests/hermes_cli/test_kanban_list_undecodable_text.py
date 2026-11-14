@@ -77,7 +77,7 @@ def test_show_json_survives_blob_cells_in_sibling_tables(board):
 
 
 def test_respawn_guard_survives_blob_comment_body_and_failure_error(board):
-    """A BLOB-typed ``task_comments.body`` or ``tasks.last_failure_error`` must not
+    """A BLOB-typed ``task_comments.body`` or ``task_runs.error`` must not
     abort ``check_respawn_guard`` (issue #116473). Both raw reads previously handed
     ``bytes`` to a ``str`` regex, raising ``TypeError`` and killing the whole
     dispatch pass after the poisoned row."""
@@ -94,10 +94,8 @@ def test_respawn_guard_survives_blob_comment_body_and_failure_error(board):
         # The whole pass must not abort on the poisoned row.
         kbd.dispatch_once(conn, dry_run=True)
 
+        kb.claim_task(conn, tid)
         with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                (sqlite3.Binary(b"429 quota exceeded"), tid),
-            )
-        # BLOB last_failure_error still matches the quota/auth blocker pattern.
+            kb._end_run(conn, tid, outcome="spawn_failed", error=sqlite3.Binary(b"429 quota exceeded"))
+        # BLOB run diagnostics still match the quota/auth blocker pattern.
         assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"

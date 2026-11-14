@@ -477,12 +477,11 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         ("Workstream C items C-3 and C-4: author t  (90.59s)", None),
         ("docs authored by the previous cycle", None),
         ("relying on an authoritative source", None),
-        # Genuine auth failures must still trip the guard, one row per
-        # curated stem family (bare, -ate, -ize, -ise).
+        # Auth failures guard; authorization progress is ordinary prose.
         ("401 auth failed", "blocker_auth"),
         ("authentication error from provider", "blocker_auth"),
-        ("still authorizing the request", "blocker_auth"),
-        ("still authorising the request", "blocker_auth"),
+        ("still authorizing the request", None),
+        ("still authorising the request", None),
     ],
 )
 def test_respawn_guard_blocker_auth_curated_not_open_stem(
@@ -491,11 +490,13 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
     """``_RESPAWN_BLOCKER_RE`` used to use an open ``auth\\w*`` stem that matched
     ordinary English words like "author"/"authored"/"authoring"/"authoritative"
     in worker progress prose, parking a healthy ``ready`` card forever (#117009).
-    The auth family must be a curated set of real auth-failure tokens."""
+    Only run-level auth-failure diagnostics should guard a retry."""
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="prose", assignee="a")
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome="spawn_failed", error=error_text)
         conn.execute(
             "UPDATE tasks SET last_failure_error=? WHERE id=?",
             (error_text, tid),
@@ -507,8 +508,7 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
 def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
     """A plain crash's captured stdout is context, not a diagnosis.
 
-    ``_classify_dead_worker`` appends the worker's last output to the persisted
-    failure text.  A benign command such as ``claude auth status`` must not turn
+    A benign command such as ``claude auth status`` must not turn
     an unrelated crash into a permanent auth guard on the next dispatch.
     """
     with kbc.connect() as conn:
@@ -516,9 +516,9 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         kb.claim_task(conn, crashed_id)
         crashed_run_id = kb.get_task(conn, crashed_id).current_run_id
         conn.execute(
-            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? "
+            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=?, error=? "
             "WHERE id=?",
-            (5_000_000, crashed_run_id),
+            (5_000_000, "pid 1 killed by signal 9. Worker's last output: claude auth status", crashed_run_id),
         )
         conn.execute(
             "UPDATE tasks SET status='ready', current_run_id=NULL, "
@@ -535,9 +535,9 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         kb.claim_task(conn, spawn_failed_id)
         spawn_run_id = kb.get_task(conn, spawn_failed_id).current_run_id
         conn.execute(
-            "UPDATE task_runs SET outcome='spawn_failed', status='failed', ended_at=? "
+            "UPDATE task_runs SET outcome='spawn_failed', status='failed', ended_at=?, error=? "
             "WHERE id=?",
-            (5_000_000, spawn_run_id),
+            (5_000_000, "provider authentication failed", spawn_run_id),
         )
         conn.execute(
             "UPDATE tasks SET status='ready', current_run_id=NULL, "

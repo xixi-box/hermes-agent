@@ -52,19 +52,18 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 # Respawn guard constants
 # ---------------------------------------------------------------------------
 
-# Patterns in last_failure_error that indicate a quota / auth blocker.
-# These errors won't resolve by retrying immediately — auto-block instead.
-# The auth family is a curated list, not an open `auth\w*` stem: that stem
-# also matched ordinary English words like "author"/"authored"/"authoring"/
-# "authoritative" in worker progress prose, parking a healthy card forever
-# (#117009).
+# Match provider failure diagnostics, not bare nouns in worker progress prose.
+# Captured output is removed before matching; crash output is never a diagnosis.
 _RESPAWN_BLOCKER_RE = re.compile(
-    r"\b(quota|rate[\s_\-]?limit|429|403|"
-    r"auth|authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
-    r"authoris(?:e|es|ed|ing|ation)|authz|"
-    r"unauthorized|forbidden|billing|subscription|"
-    r"access[\s_]denied|permission[\s_]denied|"
-    r"invalid[\s_]api[\s_]key)\b",
+    r"\b(?:401|403|429|unauthori[sz]ed|forbidden|"
+    r"(?:access|permission)[\s_]denied|invalid[\s_]api[\s_]key|"
+    r"(?:auth(?:entication|orization|orisation)?|authz)[\s_:-]+"
+    r"(?:error|fail(?:ed|ure)?|denied|invalid|expired)|"
+    r"(?:credentials?|tokens?)[\s_:-]+(?:rejected|expired|invalid)|"
+    r"(?:invalid|expired|rejected)[\s_:-]+(?:credentials?|tokens?)|"
+    r"quota[\s_:-]+(?:exhausted|exceeded)|insufficient_quota|"
+    r"exceeded your current quota|(?:billing|subscription)[\s_:-]+(?:limit|expired)|"
+    r"rate[\s_\-]?limit(?:ed|ing)?)\b",
     re.IGNORECASE,
 )
 
@@ -1563,8 +1562,8 @@ def check_respawn_guard(
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
-    ``last_failure_error`` that would otherwise park the task forever — that
+    checked BEFORE ``blocker_auth`` so the run's quota diagnostic delays a retry
+    instead of parking the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
@@ -1576,7 +1575,7 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT 1 FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1591,35 +1590,36 @@ def check_respawn_guard(
     #    reaches the breaker.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at, metadata FROM task_runs "
+        "SELECT outcome, ended_at, metadata, error FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    if latest_outcome == "spawn_failed":
         if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
-    if latest_run is not None and latest_run["outcome"] == "rate_limited":
+    if latest_outcome == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
+            # its quota diagnostic doesn't re-trap the task.
             return None
         ended_at = _kb._to_epoch(latest_run["ended_at"])
         if ended_at is not None and (now - ended_at) < rl_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
+        # run's rate-limit diagnostic; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
+    # 2. Only the latest run diagnoses a blocker; task stamps survive handoffs. A plain
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
     # benign commands such as ``claude auth status`` (#117097).
-    err = _kb._lossy_text(row["last_failure_error"])
-    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    err = _kb._lossy_text(latest_run["error"] or "") if latest_run is not None else ""
+    err = err.partition(WORKER_OUTPUT_SEP)[0]
     if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
