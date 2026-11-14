@@ -542,24 +542,29 @@ def _is_azure_responses(params: dict[str, Any]) -> bool:
     return base_url_host_matches(base_url, "openai.azure.com") or base_url_host_matches(base_url, "services.ai.azure.com")
 
 
-def _newest_reasoning_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _newest_reasoning_only(
+    messages: list[dict[str, Any]], *, newest_before: Optional[int] = None,
+) -> list[dict[str, Any]]:
     """Copy of ``messages`` keeping ``codex_reasoning_items`` only on the newest assistant row that has any.
     Foundry rejects a request that replays encrypted reasoning from more than one prior response (HTTP 400
     "Conflicting authenticated continuation identities", #105369). ``compaction`` checkpoints stay everywhere.
+    ``newest_before`` freezes selection before later appended rows (zero omits all reasoning).
     A trimmed row is marked ``codex_reasoning_trimmed`` so the converter still drops its ``msg_*`` id (#97427)."""
     out: list[dict[str, Any]] = []
     newest_kept = False
-    for msg in reversed(messages):
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
         items = msg.get("codex_reasoning_items") if isinstance(msg, dict) and msg.get("role") == "assistant" else None
         if isinstance(items, list) and any(isinstance(i, dict) and i.get("type") != "compaction" for i in items):
-            if newest_kept:
+            if newest_kept or (newest_before is not None and index >= newest_before):
                 checkpoints = [i for i in items if isinstance(i, dict) and i.get("type") == "compaction"]
                 msg = dict(msg, codex_reasoning_trimmed=True)
                 if checkpoints:
                     msg["codex_reasoning_items"] = checkpoints
                 else:
                     msg.pop("codex_reasoning_items")
-            newest_kept = True
+            else:
+                newest_kept = True
         out.append(msg)
     out.reverse()
     return out
@@ -646,6 +651,11 @@ class ResponsesApiTransport(ProviderTransport):
     # Wire models that 400'd on ``reasoning.context`` this session (the transport is cached per agent).
     _all_turns_rejected: frozenset = frozenset()
     _last_sent_all_turns: bool = False
+
+    def __init__(self) -> None:
+        from agent.transports.codex_replay import AzureReasoningReplay
+
+        self._azure_reasoning_replay = AzureReasoningReplay()
 
     def reject_all_turns(self, error: Any) -> bool:
         """400 naming ``reasoning.context``/``all_turns`` on a request that carried the opt-in: omit it for that
@@ -759,10 +769,6 @@ class ResponsesApiTransport(ProviderTransport):
         replay_encrypted_reasoning = bool(params.get("replay_encrypted_reasoning", True)) and not (
             _is_azure_foundry_responses(params) and _is_post_tool_replay(payload_messages)
         )
-        # Own predicate: #101243 may narrow _is_azure_foundry_responses to the project gateway, and the
-        # multi-item rejection happens on resource-level hosts too.
-        if replay_encrypted_reasoning and _is_azure_responses(params):
-            payload_messages = _newest_reasoning_only(payload_messages)
         # One predicate decides whether context_management goes out AND whether the converter may replay a checkpoint.
         context_management = params.get("context_management")
         native_compaction_active = _native_compaction_active(context_management)
@@ -777,6 +783,16 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides") or {}
         # An override may rewrite the wire model; provenance must be stamped with what actually goes out.
         wire_model = _strip_ctx_variant(request_overrides.get("model", model))
+        # The multi-response rejection also affects resource-level Azure hosts.
+        if _is_azure_responses(params):
+            issuer_kind = self._resolve_issuer_kind(params, endpoint)
+            newest_before = self._azure_reasoning_replay.select(
+                payload_messages,
+                route=(issuer_kind, wire_model, params.get("session_id")),
+                enabled=replay_encrypted_reasoning, issuer_kind=issuer_kind, issuer_model=wire_model,
+                native_compaction_active=native_compaction_active,
+            )
+            payload_messages = _newest_reasoning_only(payload_messages, newest_before=newest_before)
         kwargs = {
             # ``-900k`` picker variants are Hermes-side aliases; the backend knows only the base slug.
             "model": wire_model,
